@@ -58,8 +58,8 @@ class Blocker:
         return f"{self.source}|{self.process}|{self.pid}|{self.kind}|{self.reason}"
 
 
-def _run(cmd: list[str], timeout: float = 10) -> str:
-    """Run a command and return stdout ('' if it isn't available or fails)."""
+def _run(cmd: list[str], timeout: float = 10, stderr: bool = False) -> str:
+    """Run a command and return stdout (plus stderr if asked); '' on failure."""
     if not shutil.which(cmd[0]):
         return ""
     try:
@@ -68,7 +68,7 @@ def _run(cmd: list[str], timeout: float = 10) -> str:
             kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                            errors="replace", **kwargs)
-        return p.stdout
+        return p.stdout + (p.stderr if stderr else "")
     except (OSError, subprocess.SubprocessError):
         return ""
 
@@ -314,6 +314,129 @@ def get_idle_seconds() -> float | None:
             "Linux": linux_idle_seconds}.get(SYSTEM, lambda: None)()
 
 
+# --------------------------------------------------------------------------- #
+# Lock timeout auto-detection
+# --------------------------------------------------------------------------- #
+
+DEFAULT_THRESHOLD = 300.0
+
+
+def _int(s) -> int | None:
+    try:
+        return int(str(s).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def mac_lock_timeout() -> tuple[float | None, str]:
+    cands = []
+    ss = _int(_run(["defaults", "-currentHost", "read", "com.apple.screensaver",
+                    "idleTime"]))
+    if ss is None:  # never set -> macOS default is 20 min
+        ss = 1200
+    if ss > 0:
+        cands.append((ss, "screen saver"))
+    m = re.search(r"^\s*displaysleep\s+(\d+)", _run(["pmset", "-g"]), re.M)
+    if m and int(m.group(1)) > 0:
+        cands.append((int(m.group(1)) * 60, "display sleep"))
+    if not cands:
+        return None, "screen saver and display sleep are both off"
+    secs, what = min(cands)
+    lock = _run(["sysadminctl", "-screenLock", "status"], stderr=True)
+    if "is off" in lock:
+        _warn_once("macOS 'require password after screen saver' is off; the screen never locks.")
+    m = re.search(r"delay is (\d+) seconds", lock)
+    if m:
+        secs += int(m.group(1))
+        what += f" + {m.group(1)}s lock delay"
+    return float(secs), what
+
+
+def win_lock_timeout() -> tuple[float | None, str]:
+    cands = []
+    try:
+        import winreg
+        for root, path in ((winreg.HKEY_CURRENT_USER,
+                            r"Software\Policies\Microsoft\Windows\Control Panel\Desktop"),
+                           (winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop")):
+            try:
+                with winreg.OpenKey(root, path) as k:
+                    def val(name):
+                        try:
+                            return winreg.QueryValueEx(k, name)[0]
+                        except OSError:
+                            return None
+                    t = _int(val("ScreenSaveTimeOut"))
+                    if str(val("ScreenSaveActive")) != "0" and t:
+                        cands.append((t, "screen saver"))
+                        break
+            except OSError:
+                continue
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System") as k:
+                t = _int(winreg.QueryValueEx(k, "InactivityTimeoutSecs")[0])
+                if t:
+                    cands.append((t, "inactivity policy"))
+        except OSError:
+            pass
+    except ImportError:
+        pass
+    # Display-off timeout; the last two hex values are the AC and DC settings.
+    vals = re.findall(r":\s*0x([0-9a-fA-F]{8})\s*$",
+                      _run(["powercfg", "/q", "SCHEME_CURRENT", "SUB_VIDEO", "VIDEOIDLE"]),
+                      re.M)[-2:]
+    for v in vals:
+        if int(v, 16) > 0:
+            cands.append((int(v, 16), "display off"))
+    if not cands:
+        return None, "no screen saver, inactivity policy or display-off timeout"
+    secs, what = min(cands)
+    return float(secs), what
+
+
+def _gs(schema: str, key: str) -> str:
+    """gsettings value without its type prefix/quotes ('uint32 300' -> '300')."""
+    parts = _run(["gsettings", "get", schema, key]).split()
+    return parts[-1].strip("'") if parts else ""
+
+
+def linux_lock_timeout() -> tuple[float | None, str]:
+    idle = _int(_gs("org.gnome.desktop.session", "idle-delay"))
+    if idle:
+        if _gs("org.gnome.desktop.screensaver", "lock-enabled") == "false":
+            _warn_once("GNOME screen lock is turned off (Settings > Privacy > Screen Lock).")
+        delay = _int(_gs("org.gnome.desktop.screensaver", "lock-delay")) or 0
+        return float(idle + delay), "GNOME idle delay" + (f" + {delay}s lock delay" if delay else "")
+    idle = _int(_gs("org.cinnamon.desktop.session", "idle-delay"))
+    if idle:
+        return float(idle), "Cinnamon idle delay"
+    for tool in ("kreadconfig6", "kreadconfig5"):
+        if shutil.which(tool):
+            args = [tool, "--file", "kscreenlockerrc", "--group", "Daemon", "--key"]
+            if _run(args + ["Autolock"]).strip() == "false":
+                _warn_once("KDE automatic screen locking is turned off.")
+            mins = _int(_run(args + ["Timeout"])) or 5  # Plasma default
+            return float(mins * 60), "KDE screen locker"
+    if os.environ.get("DISPLAY"):
+        m = re.search(r"timeout:\s*(\d+)", _run(["xset", "q"]))
+        if m and int(m.group(1)) > 0:
+            return float(m.group(1)), "X11 screensaver"
+    return None, "could not read desktop lock settings"
+
+
+def detect_lock_timeout() -> tuple[float, str]:
+    """Return (seconds idle before the screen should lock, where it came from)."""
+    fn = {"Darwin": mac_lock_timeout, "Windows": win_lock_timeout,
+          "Linux": linux_lock_timeout}.get(SYSTEM)
+    secs, what = fn() if fn else (None, "unsupported OS")
+    if secs is None:
+        _warn_once(f"lock timeout not detected ({what}); using {int(DEFAULT_THRESHOLD)}s. "
+                   "Pass --idle-threshold to set it.")
+        return DEFAULT_THRESHOLD, f"default ({what})"
+    return secs, what
+
+
 def default_log_path() -> Path:
     home = Path.home()
     if SYSTEM == "Darwin":
@@ -353,7 +476,10 @@ class Watcher:
                  include_system: bool, quiet: bool):
         self.log_path = log_path
         self.interval = interval
-        self.idle_threshold = idle_threshold
+        self.auto_threshold = idle_threshold is None
+        self.threshold_checked = 0.0
+        self.idle_threshold = DEFAULT_THRESHOLD if idle_threshold is None else idle_threshold
+        self.threshold_source = "auto" if self.auto_threshold else "--idle-threshold"
         self.include_system = include_system
         self.quiet = quiet
         self.active: dict[str, dict] = {}  # key -> state
@@ -374,6 +500,7 @@ class Watcher:
         idle = get_idle_seconds()
         blockers = [b for b in get_blockers() if b.blocks_display or self.include_system]
         now = time.time()
+        self._refresh_threshold(now)
         seen = set()
         for b in blockers:
             seen.add(b.key)
@@ -393,6 +520,17 @@ class Watcher:
             if key not in seen:
                 self._end(key, now)
 
+    def _refresh_threshold(self, now: float):
+        """Re-read the OS lock timeout every 10 minutes (settings can change)."""
+        if not self.auto_threshold or now - self.threshold_checked < 600:
+            return
+        first = self.threshold_checked == 0
+        self.threshold_checked = now
+        secs, src = detect_lock_timeout()
+        if first or secs != self.idle_threshold:
+            self.idle_threshold, self.threshold_source = secs, src
+            self.write("threshold", idle_threshold=round(secs), source=src)
+
     def _end(self, key: str, now: float, still_active: bool = False):
         st = self.active.pop(key)
         extra = {"still_active": True} if still_active else {}
@@ -409,7 +547,7 @@ class Watcher:
 
     def run(self):
         self.write("started", os=SYSTEM, interval=self.interval,
-                   idle_threshold=self.idle_threshold)
+                   idle_threshold="auto" if self.auto_threshold else self.idle_threshold)
         if get_idle_seconds() is None:
             _warn_once("could not read idle time; 'flagged' events will not be recorded.")
         try:
@@ -479,7 +617,9 @@ def report(log_path: Path):
 
 def snapshot(include_system: bool):
     idle = get_idle_seconds()
-    print(f"OS: {SYSTEM}   idle: {_fmt_dur(idle) if idle is not None else 'unknown'}\n")
+    lock, src = detect_lock_timeout()
+    print(f"OS: {SYSTEM}   idle: {_fmt_dur(idle) if idle is not None else 'unknown'}"
+          f"   screen should lock after: {_fmt_dur(lock)} ({src})\n")
     bl = get_blockers()
     shown = [b for b in bl if b.blocks_display or include_system]
     if not shown:
@@ -500,14 +640,21 @@ def main(argv=None):
                    help="log file (default: %(default)s)")
     p.add_argument("--interval", type=float, default=15,
                    help="seconds between checks (default: 15)")
-    p.add_argument("--idle-threshold", type=float, default=300,
-                   help="seconds idle after which your screen should have locked; "
-                        "set this to your lock timeout (default: 300)")
+    p.add_argument("--idle-threshold", default="auto",
+                   help="seconds idle after which your screen should have locked, or "
+                        "'auto' to read this machine's lock settings (default: auto)")
     p.add_argument("--all", action="store_true",
                    help="also record things that only prevent system sleep "
                         "(not the display/lock)")
     p.add_argument("--quiet", action="store_true", help="don't print events to stdout")
     a = p.parse_args(argv)
+    if str(a.idle_threshold).lower() == "auto":
+        a.idle_threshold = None
+    else:
+        try:
+            a.idle_threshold = float(a.idle_threshold)
+        except ValueError:
+            p.error("--idle-threshold must be a number of seconds or 'auto'")
 
     # Under pythonw.exe (Windows, no console) stdout/stderr are None; send
     # anything printed to a file next to the log instead of crashing.

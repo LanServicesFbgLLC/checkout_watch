@@ -12,16 +12,25 @@ remote-desktop clients, and audio interfaces. lockwatch checks these every
 | event     | meaning |
 |-----------|---------|
 | `start`   | an app began keeping the display awake |
-| `flagged` | that app was still holding it after you'd been idle longer than `--idle-threshold`, so **it's the likely reason your screen didn't lock** |
+| `flagged` | that app was still holding it after you'd been idle longer than the lock timeout, so **it's the likely reason your screen didn't lock** |
+| `threshold` | the lock timeout lockwatch is using, and where it came from |
 | `end`     | the app let go (with duration and the longest idle time seen). `still_active: true` means lockwatch was stopped while the app was still holding it |
 
 ## Usage
 
 ```bash
-python3 lockwatch.py snapshot                 # what's blocking right now
-python3 lockwatch.py --idle-threshold 300     # watch; set threshold = your lock timeout in seconds
-python3 lockwatch.py report                   # summary: which apps, how often, how long
+python3 lockwatch.py snapshot     # what's blocking right now, and your lock timeout
+python3 lockwatch.py              # watch (Ctrl+C to stop)
+python3 lockwatch.py report       # summary: which apps, how often, how long
 ```
+
+lockwatch reads the machine's lock timeout itself and re-checks it every 10
+minutes:
+- macOS: screen saver start time or display sleep, plus the "require password" delay
+- Windows: screen saver timeout, the `InactivityTimeoutSecs` policy, or the display-off timeout
+- Linux: GNOME/Cinnamon idle delay, the KDE screen locker, or the X11 screensaver
+
+Use `--idle-threshold SECONDS` to set the timeout yourself.
 
 Options: `--interval N` (seconds between checks), `--all` (also log things that
 only stop *system* sleep, not the display), `--log PATH`, `--quiet`.
@@ -57,27 +66,68 @@ screen-saver policy is actually set.
 
 ## Run it in the background
 
-- **macOS**: create a LaunchAgent that runs `python3 /path/lockwatch.py --quiet`
-  with `RunAtLoad`.
-- **Windows**: copy `lockwatch.py`, `install-windows.ps1`, and
-  `install-windows.cmd` to the PC and double-click `install-windows.cmd`.
-  You can also run it from PowerShell:
+Each OS has an installer, plus launch files under `deploy/` that are **identical
+on every machine**. They use fixed install paths and auto-detect the lock
+timeout, so you can push the same files with an MDM, RMM, Ansible or group
+policy instead of running an installer on each machine.
 
-  ```powershell
-  .\install-windows.ps1                      # auto-detects the lock timeout
-  .\install-windows.ps1 -IdleThreshold 600   # or set it yourself
-  .\install-windows.ps1 -Uninstall
-  ```
+Each installer:
+- installs for just the current user by default, or for every user on the
+  machine with `--system` / admin rights
+- takes `--idle-threshold N` to override the detected timeout
+- removes lockwatch with `--uninstall` (logs are kept)
 
-  The installer asks for admin rights. It finds Python, offering to install it
-  with winget if it's missing, and detects the user's lock timeout from the
-  screen saver, the inactivity policy, and the display-off setting. It installs
-  `lockwatch.py` to `C:\Program Files\lockwatch`, which only admins can write
-  to, since the task runs elevated. It then registers a `lockwatch` scheduled
-  task that runs at logon for the signed-in user. If you install it from a
-  different admin account, it still monitors the user at the console. Use
-  `-User DOMAIN\name` to choose a different user.
-- **Linux**: create a systemd user unit
-  (`~/.config/systemd/user/lockwatch.service`) with
-  `ExecStart=/usr/bin/python3 /path/lockwatch.py --quiet`, then run
-  `systemctl --user enable --now lockwatch`.
+### macOS
+
+```bash
+./install-macos.sh                 # just you, no sudo
+sudo ./install-macos.sh --system   # every user on this Mac
+```
+
+| File | All-users location |
+|---|---|
+| `lockwatch.py`, `deploy/macos/run.sh` | `/Library/Application Support/lockwatch/` |
+| `deploy/macos/com.lanservicesfbg.lockwatch.plist` | `/Library/LaunchAgents/` (root:wheel, 644) |
+
+`run.sh` looks for Python 3 in Homebrew, then python.org, then the Xcode
+Command Line Tools. **New Macs don't include Python**, so install it first
+(`xcode-select --install`, `brew install python`, or the python.org
+installer). If `run.sh` can't find Python, it writes a note to
+`~/Library/Logs/lockwatch/stderr.log` and exits without retrying.
+
+### Linux
+
+```bash
+./install-linux.sh                 # just you
+sudo ./install-linux.sh --system   # every user on this machine
+```
+
+| File | All-users location |
+|---|---|
+| `lockwatch.py` | `/usr/local/lib/lockwatch/` |
+| `deploy/linux/lockwatch.desktop` | `/etc/xdg/autostart/` (works on any desktop) |
+| or `deploy/linux/lockwatch.service` | `/etc/systemd/user/`, then `systemctl --global enable lockwatch.service` |
+
+The installer uses the systemd user service when the desktop supports it
+(GNOME, KDE Plasma 5.25+), because it restarts on failure. Otherwise it uses
+the XDG autostart entry. Use `--method systemd|autostart` to choose. If Python 3
+is missing, it offers to install it with the system package manager.
+
+### Windows
+
+Copy `lockwatch.py`, `install-windows.ps1` and `install-windows.cmd` to the PC
+and double-click `install-windows.cmd`, or run it from PowerShell:
+
+```powershell
+.\install-windows.ps1
+.\install-windows.ps1 -IdleThreshold 600
+.\install-windows.ps1 -Uninstall
+```
+
+The installer asks for admin rights. It finds Python, offering to install it
+with winget if it's missing. It installs `lockwatch.py` to
+`C:\Program Files\lockwatch`, which only admins can write to, since the task
+runs elevated. It then registers a `lockwatch` scheduled task that runs at
+logon for the signed-in user. If you install it from a different admin account,
+it still monitors the user at the console. Use `-User DOMAIN\name` to choose a
+different user.

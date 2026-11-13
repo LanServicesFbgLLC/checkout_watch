@@ -1,0 +1,16 @@
+# lockwatch systemd *user* unit - identical on every machine.
+# All users:  copy to /etc/systemd/user/ and run: systemctl --global enable lockwatch.service
+# Script:     /usr/local/lib/lockwatch/lockwatch.py   Log: ~/.local/state/lockwatch/
+# The lock timeout is read from each user's desktop settings.
+[Unit]
+Description=lockwatch - record what prevents the screen from locking
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/env python3 /usr/local/lib/lockwatch/lockwatch.py --quiet
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=graphical-session.target

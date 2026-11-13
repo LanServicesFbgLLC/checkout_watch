@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  lockwatch LaunchAgent - identical on every Mac.
+  Put this in /Library/LaunchAgents (all users) and run.sh + lockwatch.py in
+  /Library/Application Support/lockwatch/. install-macos.sh does this, or push
+  the same files with an MDM. Each user's log: ~/Library/Logs/lockwatch/.
+  The lock timeout is read from each Mac's own settings.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.lanservicesfbg.lockwatch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>/Library/Application Support/lockwatch/run.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <!-- Restart if it crashes; run.sh exits 0 (no restart) when Python is missing. -->
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+</dict>
+</plist>

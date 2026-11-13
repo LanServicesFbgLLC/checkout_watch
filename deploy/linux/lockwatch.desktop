@@ -1,0 +1,10 @@
+[Desktop Entry]
+# lockwatch XDG autostart entry - identical on every machine, works on any desktop.
+# All users: copy to /etc/xdg/autostart/.  Script: /usr/local/lib/lockwatch/lockwatch.py
+Type=Application
+Name=lockwatch
+Comment=Record what prevents the screen from locking
+Exec=/usr/bin/env python3 /usr/local/lib/lockwatch/lockwatch.py --quiet
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

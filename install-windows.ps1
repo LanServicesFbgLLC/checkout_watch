@@ -6,8 +6,8 @@
     - Copies lockwatch.py to C:\Program Files\lockwatch (admin-only writable,
       because the task runs elevated - powercfg /requests requires it).
     - Finds pythonw.exe (installs Python with winget if missing and you agree).
-    - Works out the user's lock timeout (screen saver, machine inactivity
-      policy, display-off timeout) unless -IdleThreshold is given.
+    - lockwatch reads the user's lock timeout (screen saver, inactivity
+      policy, display-off timeout) itself unless -IdleThreshold is given.
     - Registers a task that starts at logon for the signed-in user with
       highest privileges, restarts on failure, and never times out.
     Logs go to %LOCALAPPDATA%\lockwatch\lockwatch.jsonl for that user.
@@ -19,7 +19,7 @@
 
 .PARAMETER IdleThreshold
     Seconds idle after which the screen should have locked. Auto-detected
-    if omitted (falls back to 900).
+    by lockwatch if omitted.
 
 .PARAMETER Uninstall
     Removes the task and the program folder (logs are left in place).
@@ -135,34 +135,14 @@ if ($pythonw -like "$env:SystemDrive\Users\*" -and $pythonw -notlike "*\$($User.
 Write-Host "Using Python: $pythonw"
 
 # --- Idle threshold ----------------------------------------------------------
-function Get-LockTimeout([string]$sid) {
-    $found = @()
-    $hku = "Registry::HKEY_USERS\$sid"
-    foreach ($key in "$hku\Software\Policies\Microsoft\Windows\Control Panel\Desktop",
-                     "$hku\Control Panel\Desktop") {
-        $d = Get-ItemProperty $key -ErrorAction SilentlyContinue
-        if ($d -and $d.ScreenSaveActive -ne '0' -and [int]$d.ScreenSaveTimeOut -gt 0) {
-            $found += [int]$d.ScreenSaveTimeOut; break
-        }
-    }
-    $pol = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction SilentlyContinue
-    if ($pol -and [int]$pol.InactivityTimeoutSecs -gt 0) { $found += [int]$pol.InactivityTimeoutSecs }
-    # Display-off timeout on AC (lock often follows display off)
-    $q = powercfg /q SCHEME_CURRENT SUB_VIDEO VIDEOIDLE 2>$null
-    $ac = $q | Select-String 'Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)' | Select-Object -First 1
-    if ($ac) { $v = [Convert]::ToInt32($ac.Matches[0].Groups[1].Value, 16); if ($v -gt 0) { $found += $v } }
-    if ($found) { return ($found | Measure-Object -Minimum).Minimum }
-    return 0
-}
-
-if ($IdleThreshold -le 0) {
-    $IdleThreshold = Get-LockTimeout $sid
-    if ($IdleThreshold -le 0) {
-        $IdleThreshold = 900
-        Write-Warning 'Could not detect a lock timeout; using 900 seconds. Override with -IdleThreshold.'
-    } else {
-        Write-Host "Detected lock timeout: $IdleThreshold seconds"
-    }
+# By default lockwatch reads the user's lock settings itself (screen saver,
+# inactivity policy, display-off timeout) and re-checks them every 10 minutes.
+$thresholdArg = ''
+if ($IdleThreshold -gt 0) {
+    $thresholdArg = " --idle-threshold $IdleThreshold"
+    Write-Host "Idle threshold: $IdleThreshold seconds"
+} else {
+    Write-Host "Idle threshold: auto (read from this user's lock settings)"
 }
 
 # --- Install files -----------------------------------------------------------
@@ -178,7 +158,7 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 }
 
 $action    = New-ScheduledTaskAction -Execute $pythonw `
-               -Argument "`"$InstallDir\lockwatch.py`" --quiet --idle-threshold $IdleThreshold" `
+               -Argument "`"$InstallDir\lockwatch.py`" --quiet$thresholdArg" `
                -WorkingDirectory $InstallDir
 $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $User
 $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
