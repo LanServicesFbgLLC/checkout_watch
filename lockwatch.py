@@ -569,6 +569,8 @@ def report(log_path: Path):
         print(f"No log at {log_path}")
         return
     stats: dict[str, dict] = {}
+    open_since: dict[str, tuple[str, datetime]] = {}  # blocker key -> (name, start)
+    carried: set[str] = set()  # still active when lockwatch stopped/restarted
     first = last = None
     for line in log_path.open(encoding="utf-8"):
         try:
@@ -584,15 +586,34 @@ def report(log_path: Path):
         if b.get("extra", {}).get("on_behalf_of"):
             name += f" (for {b['extra']['on_behalf_of']})"
         s = stats.setdefault(name, {"sessions": 0, "seconds": 0, "flagged": 0,
-                                    "display": False, "reasons": set()})
+                                    "display": False, "reasons": set(),
+                                    "active": False})
+        key = f"{b['source']}|{b['process']}|{b['pid']}|{b['kind']}|{b['reason']}"
         s["display"] |= b["blocks_display"]
         if b["reason"]:
             s["reasons"].add(b["reason"][:80])
-        if rec["event"] == "end":
-            s["sessions"] += 1
+        if rec["event"] == "start":
+            # A blocker that was still active when lockwatch restarted is the
+            # same occurrence, not a new one.
+            if key in carried:
+                carried.discard(key)
+            else:
+                s["sessions"] += 1
+            open_since[key] = (name, datetime.fromisoformat(rec["time"]))
+        elif rec["event"] == "end":
             s["seconds"] += rec.get("duration_seconds", 0)
+            open_since.pop(key, None)
+            if rec.get("still_active"):
+                carried.add(key)
         elif rec["event"] == "flagged":
             s["flagged"] += 1
+
+    # Blockers still active at the end of the log count up to the last entry.
+    if last:
+        end = datetime.fromisoformat(last)
+        for name, start in open_since.values():
+            stats[name]["seconds"] += max(0, (end - start).total_seconds())
+            stats[name]["active"] = True
 
     print(f"Log: {log_path}\nPeriod: {first}  ->  {last}\n")
     if not stats:
@@ -603,7 +624,8 @@ def report(log_path: Path):
     print("-" * 78)
     for name, s in rows:
         print(f"{name[:40]:40} {'yes' if s['display'] else 'no (sleep)':11} "
-              f"{s['flagged']:>7} {s['sessions']:>5} {_fmt_dur(s['seconds']):>11}")
+              f"{s['flagged']:>7} {s['sessions']:>5} {_fmt_dur(s['seconds']):>11}"
+              f"{'  (active now)' if s['active'] else ''}")
     print("\nFLAGGED = times it was holding the screen awake after you'd been idle "
           "past the threshold.\nReasons given:")
     for name, s in rows:
