@@ -131,3 +131,7 @@ runs elevated. It then registers a `lockwatch` scheduled task that runs at
 logon for the signed-in user. If you install it from a different admin account,
 it still monitors the user at the console. Use `-User DOMAIN\name` to choose a
 different user.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
